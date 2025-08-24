@@ -1,0 +1,317 @@
+# sleep_app.py
+# Single-file Flask app: Manual Sleep Tracking (form + table + chart)
+# ---------------------------------------------------------------
+# How to run:
+#   pip install flask sqlalchemy flask_sqlalchemy
+#   python sleep_app.py
+#   Open http://127.0.0.1:5000
+#
+# To integrate with your existing app:
+# - Move the Sleep model into your models module
+# - Register the blueprints/routes below into your app factory
+# - Mount the HTML in your dashboard template or keep as a dedicated page
+
+from datetime import datetime, date, timedelta
+from collections import defaultdict
+
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask_sqlalchemy import SQLAlchemy
+
+app = Flask(_name_)
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///sleep.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+# ---------------------------
+# Database Model
+# ---------------------------
+class Sleep(db.Model):
+    _tablename_ = "sleep"
+    id = db.Column(db.Integer, primary_key=True)
+    # If you have auth/users, add user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
+    date = db.Column(db.Date, nullable=False, default=date.today)
+    sleep_hours = db.Column(db.Float, nullable=False)
+    notes = db.Column(db.String(200), default="")
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "date": self.date.strftime("%Y-%m-%d"),
+            "sleep_hours": self.sleep_hours,
+            "notes": self.notes or ""
+        }
+
+with app.app_context():
+    db.create_all()
+
+# ---------------------------
+# HTML (single file via render_template_string)
+# ---------------------------
+PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Manual Sleep Tracker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link
+    href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+    rel="stylesheet"
+  />
+  <style>
+    :root { --bg:#0b1220; --card:#121a2a; --muted:#8aa0c5; }
+    body { background: var(--bg); color: #e7eefc; }
+    main.container { max-width: 980px; }
+    .card { background: var(--card); border-radius: 16px; padding: 1rem 1.25rem; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    .muted { color: var(--muted); font-size: .9rem; }
+    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .grid-1 { display:grid; grid-template-columns: 1fr; gap: 1rem; }
+    @media (max-width: 900px){ .grid-2{ grid-template-columns:1fr; } }
+    table thead th { color:#bcd1ff; }
+    .chip { padding:.15rem .6rem; border-radius: 999px; background:#1e2b46; font-size:.8rem; }
+    .delete-btn { background:#2a3b60; border:none; }
+  </style>
+</head>
+<body>
+<main class="container">
+  <header style="margin: 2rem 0 1rem;">
+    <h2>🛌 Manual Sleep Tracker</h2>
+    <p class="muted">Log your sleep, see history, and track trends for the last 14 days.</p>
+  </header>
+
+  <section class="grid-2">
+    <div class="card">
+      <h4>Add Sleep Log</h4>
+      <form id="sleep-form">
+        <div class="grid-2">
+          <div>
+            <label for="date">Date</label>
+            <input type="date" id="date" required />
+          </div>
+          <div>
+            <label for="hours">Hours slept</label>
+            <input type="number" id="hours" step="0.1" min="0" max="24" placeholder="e.g. 7.5" required />
+          </div>
+        </div>
+        <label for="notes">Notes (optional)</label>
+        <input type="text" id="notes" placeholder="Late night study / Early wake-up..." />
+        <button type="submit">Save</button>
+      </form>
+      <small id="msg" class="muted"></small>
+    </div>
+
+    <div class="card">
+      <h4>Sleep Trend (Last 14 Days)</h4>
+      <canvas id="sleepChart"></canvas>
+      <p class="muted">Target <span class="chip">8h/night</span>. Tip: keep regular sleep & wake times.</p>
+    </div>
+  </section>
+
+  <section style="margin-top:1rem" class="card">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
+      <h4 style="margin:0;">Sleep History</h4>
+      <button id="refresh">↻ Refresh</button>
+    </div>
+    <div class="grid-1">
+      <table id="sleep-table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Hours</th>
+            <th>Notes</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody><!-- rows injected --></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const $ = (sel) => document.querySelector(sel);
+const form = $("#sleep-form");
+const msg = $("#msg");
+const tableBody = document.querySelector("#sleep-table tbody");
+const refreshBtn = $("#refresh");
+
+function todayStr(){
+  const d = new Date();
+  const m = (d.getMonth()+1).toString().padStart(2,"0");
+  const day = d.getDate().toString().padStart(2,"0");
+  return ${d.getFullYear()}-${m}-${day};
+}
+$("#date").value = todayStr();
+
+async function fetchJSON(url, opts={}) {
+  const res = await fetch(url, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
+async function loadTable() {
+  const data = await fetchJSON("/sleep/list");
+  tableBody.innerHTML = "";
+  data.sort((a,b) => (a.date < b.date ? 1 : -1));
+  for (const row of data) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${row.date}</td>
+      <td>${row.sleep_hours}</td>
+      <td>${row.notes || ""}</td>
+      <td style="text-align:right">
+        <button class="delete-btn" data-id="${row.id}">Delete</button>
+      </td>
+    `;
+    tableBody.appendChild(tr);
+  }
+}
+
+document.addEventListener("click", async (e) => {
+  if (e.target.matches(".delete-btn")) {
+    const id = e.target.getAttribute("data-id");
+    if (!id) return;
+    try {
+      await fetchJSON("/sleep/delete/" + id, { method: "DELETE" });
+      await loadTable();
+      await loadChart();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+});
+
+let chart;
+async function loadChart() {
+  const chartData = await fetchJSON("/sleep/series?days=14");
+  const ctx = document.getElementById("sleepChart");
+  if (chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: chartData.labels,
+      datasets: [{
+        label: "Hours Slept",
+        data: chartData.values,
+        tension: 0.35,
+        fill: false
+      }]
+    },
+    options: {
+      responsive: true,
+      scales: {
+        y: { beginAtZero: true, suggestedMax: 9 }
+      },
+      plugins: {
+        legend: { display: true }
+      }
+    }
+  });
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const payload = {
+    date: $("#date").value,
+    sleep_hours: parseFloat($("#hours").value),
+    notes: $("#notes").value || ""
+  };
+  try {
+    await fetchJSON("/sleep/create", { method: "POST", body: JSON.stringify(payload) });
+    msg.textContent = "Saved ✓";
+    setTimeout(() => msg.textContent = "", 1500);
+    form.reset();
+    $("#date").value = todayStr();
+    await loadTable();
+    await loadChart();
+  } catch (err) {
+    msg.textContent = "Error: " + err.message;
+  }
+});
+
+refreshBtn.addEventListener("click", async () => {
+  await loadTable();
+  await loadChart();
+});
+
+(async function init(){
+  await loadTable();
+  await loadChart();
+})();
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------
+# Routes
+# ---------------------------
+@app.get("/")
+def index():
+    return render_template_string(PAGE)
+
+@app.get("/sleep/list")
+def sleep_list():
+    rows = Sleep.query.order_by(Sleep.date.asc()).all()
+    return jsonify([r.as_dict() for r in rows])
+
+@app.post("/sleep/create")
+def sleep_create():
+    data = request.get_json(force=True)
+    try:
+        d = datetime.strptime(data.get("date"), "%Y-%m-%d").date()
+    except Exception:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+    try:
+        hours = float(data.get("sleep_hours"))
+        if hours < 0 or hours > 24:
+            raise ValueError
+    except Exception:
+        return jsonify({"error": "sleep_hours must be a number between 0 and 24."}), 400
+
+    notes = (data.get("notes") or "").strip()
+    row = Sleep(date=d, sleep_hours=hours, notes=notes)
+    db.session.add(row)
+    db.session.commit()
+    return jsonify({"message": "Sleep data added", "row": row.as_dict()}), 201
+
+@app.delete("/sleep/delete/<int:row_id>")
+def sleep_delete(row_id):
+    row = Sleep.query.get_or_404(row_id)
+    db.session.delete(row)
+    db.session.commit()
+    return jsonify({"message": "Deleted", "id": row_id})
+
+@app.get("/sleep/series")
+def sleep_series():
+    """
+    Returns a simple time series for the last N days (default 14) with zero-filled gaps.
+    labels: ["YYYY-MM-DD", ...]
+    values: [hours, ...]
+    """
+    days = request.args.get("days", default=14, type=int)
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+
+    # Sum hours by date (if multiple entries exist in a day, they add up)
+    by_date = defaultdict(float)
+    rows = Sleep.query.filter(Sleep.date >= start, Sleep.date <= end).all()
+    for r in rows:
+        by_date[r.date] += float(r.sleep_hours)
+
+    labels, values = [], []
+    cur = start
+    while cur <= end:
+        labels.append(cur.strftime("%Y-%m-%d"))
+        values.append(round(by_date.get(cur, 0.0), 2))
+        cur += timedelta(days=1)
+
+    return jsonify({"labels": labels, "values": values})
+
+# ---------------------------
+# Entry
+# ---------------------------
+if _name_ == "_main_":
+    app.run(debug=True)
